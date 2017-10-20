@@ -117,7 +117,7 @@ def train(epoch):
             train_acc = 0
 
         # exit training phase
-        if batch_idx >= 10:
+        if batch_idx >= val_split:
             return
 
 def test():
