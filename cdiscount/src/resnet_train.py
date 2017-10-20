@@ -1,214 +1,193 @@
 import os
 import pickle
-import itertools
 import io
 import bson
-import threading
-from scipy.ndimage import imread
-import cv2
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score
+from PIL import Image
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
-from resnet import *
-import time
-start_time = time.time()
-
+from models.resnet import *
+from torchvision import transforms
 
 # writes loss to file
-def write_loss(x):
-    with open('loss.txt', 'a') as f:
-        f.write(x+'\n')
+def write_loss(loss, acc):
+    w = '{}, {}\n'.format(format(loss, '.3f'), format(acc, '.2f'))
+    with open('exp2_loss.txt', 'a') as f:
+        f.write(w)
 
+def batch_generator(data_path, size=130, batch_size=32, return_labels=True):
 
-# helper to generate batch of data from source bson data
-def grouper(n, iterable):
-    it = iter(iterable)
-    while True:
-        chunk = tuple(itertools.islice(it, n))
-        if not chunk:
-            return
-        yield chunk
-
-
-# threadsafe 
-class threadsafe_iter:
-    def __init__(self, it):
-        self.it = it
-        self.lock = threading.Lock()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        with self.lock:
-            return self.it.__next__()
-
-
-# decorator to wrap generator with threadsafe           
-def threadsafe(f):
-    def g(*a, **kw):
-        return threadsafe_iter(f(*a, **kw))
-    return g
-
-
-# batch generator to process and yield batch from source bson data
-@threadsafe
-def batch_generator(data_path, batch_size=32, return_labels=True):
+    # preprocessing pipeline
+    process = transforms.Compose([
+        transforms.Scale(size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        lambda x: x.cuda().view(1,3,size,size),
+        transforms.Normalize(mean=[.485, .456, .406],
+                             std=[.229, .224, .225])
+        ])
     
     # decode data
-    documents = bson.decode_file_iter(open(data_path, 'rb'))
-    for batch in grouper(batch_size, documents): 
-        x = []
-        y = []
-        for elem in batch:
-            
-            # get features
-            img = elem.get('imgs')[0]
-            img = imread(io.BytesIO(img.get('picture', None)))
-            
-            # get label
-            category = elem.get('category_id', '')
-            label = labelencoder.transform([category]) if category else None
+    data = bson.decode_file_iter(open(data_path, 'rb'))
 
-            # process and append
-            img = cv2.resize(img.astype('float32') / 255.0, (160, 160))
-            x.append(img)
-            y.append(label)
+    # iterate over data items
+    x = torch.FloatTensor(()).cuda()
+    y = torch.LongTensor(()).cuda()
+    for item in data:
 
-        x = Variable(torch.from_numpy(np.array(x).transpose(0, 3, 1, 2)).cuda())
-        y = Variable(torch.from_numpy(np.array(y).ravel()).cuda())
+        # get item label
+        category = item.get('category_id', '')
+        label = int(labelencoder.transform([category])) if category else 0
+        label = torch.LongTensor([label]).cuda()
 
-        if return_labels:
-            yield x, y
-        else:
-            yield x
+        # get images in item and process
+        for image in item.get('imgs'):
 
+            # from binary, process, augment and to tensor
+            proc_img = process(Image.open(io.BytesIO(image.get('picture', None))))
 
-# load labelencoder and categories if they exist
-if os.path.isfile('../data/labelencoder.pkl'):
-    with open('../data/labelencoder.pkl', 'rb') as f:
-        labelencoder = pickle.load(f)
-    categories = pd.read_csv('../data/categories.csv')
+            # add to batch
+            x = torch.cat([x, proc_img])
+            y = torch.cat([y, label])
 
-# else create label encoder and categories
-else:
-    documents = bson.decode_file_iter(open('../data/train.bson', 'rb'))
-    categories = [(d['_id'], d['category_id']) for d in documents]
-    categories = pd.DataFrame(categories, columns=['id', 'cat'])
-    categories.to_csv('../data/categories.csv')
-    labelencoder = LabelEncoder()
-    labelencoder.fit(categories.cat.unique().ravel())
-    with open('../data/labelencoder.pkl', 'wb') as f:
-        pickle.dump(labelencoder, f)
+            if x.size(0) == batch_size:
 
-
-# parameters
-batch_size = 32
-learning_rate = 1e-5
-epochs = 3
-num_classes = len(labelencoder.classes_)
-val_split = round(0.9*(7069896//batch_size))
-
-# model; freeze conv layer and train fully connected
-model = resnet50(pretrained=True)
-for param in model.parameters():
-    param.requires_grad = False
-model.fc = nn.Linear(2048, num_classes)
-model = model.cuda()
-
-# loss and optimizer
-crit = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.fc.parameters(), lr=learning_rate)
+                if return_labels:
+                    yield Variable(x), Variable(y)
+                else:
+                    yield Variable(x)
+                
+                x = torch.FloatTensor(()).cuda()
+                y = torch.LongTensor(()).cuda()
 
 def train(epoch):
+
+    # init stats
+    c = 0
+    train_loss = 0
+    train_acc = 0
+
+    # set model to train mode and reset gradients
     model.train()
-    for batch_idx, (data, target) in enumerate(data_loader):
-        optimizer.zero_grad()
-        output = model(data)
-        loss = crit(output, target)
+    optimizer.zero_grad()
+    
+    # iterate over training batches
+    for batch_idx, (x, y) in enumerate(data_loader):
+
+        # get batch predictions and loss
+        output = model(x)
+        loss = crit(output, y)
+        
+        # accumulate gradients
         loss.backward()
-        optimizer.step()
+        if batch_idx % accum_iter == 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
-        write_loss(format(loss.data[0], '.4f'))
+        # accumulate statistics
+        _, idx = output.cpu().max(1)
+        train_loss += loss.data[0]
+        train_acc += accuracy_score(y.cpu().data.numpy(), idx.data.numpy().ravel())
+        c += 1
 
-        if batch_idx % 100 == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)] - Loss: {:.6f}'.format(
-                epoch, batch_idx * batch_size, 7069896,
-                100. * batch_idx / (7069896//batch_size), loss.data[0]))  
-        if batch_idx >= val_split:
+        # print statistics
+        if batch_idx % print_iter == 0:
+
+            # get average loss and accuracy
+            train_loss /= c
+            train_acc /= c
+
+            # save loss and acc to file
+            write_loss(train_loss, train_acc)
+
+            # print the statistics
+            print('\rEpoch {} [{}/{} ({:.0f}%)] - loss: {:.6f} - acc: {:.3f}'.format(
+                epoch+1, batch_idx * batch_size, 7069896, 100. * batch_idx / (7069896//batch_size), 
+                train_loss, train_acc), end='')
+            
+            # reset stats
+            c = 0
+            train_loss = 0
+            train_acc = 0
+
+        # exit training phase
+        if batch_idx >= 10:
             return
 
 def test():
-    model.eval()
+
+    # init stats
     test_loss = 0
     correct = 0
-    for batch_idx, (data, target) in enumerate(data_loader):
 
-        output = model(data)
-        test_loss += crit(output, target).data[0]
+    # set model to evaluation mode
+    model.eval()
+
+    # iterate over validation batches
+    for batch_idx, (x, y) in enumerate(data_loader):
+
+        # forward pass plus stat accumulation
+        output = model(x)
+        test_loss += crit(output, y).data[0]
         pred = output.data.max(1)[1]
-        correct += pred.eq(target.data.view_as(pred)).cpu().sum()
+        correct += pred.eq(y.data.view_as(pred)).cpu().sum()
 
-    test_loss /= (batch_idx + 1) * batch_size
-    print('\nValidation set: Average loss: {:.4f}, Accuracy: {:.0f}%\n'.format(
-        test_loss, (correct / ((batch_idx + 1) * batch_size))*100)) # 100. * correct / (batch_idx + 1) * batch_size))
+    # print validation phase statistics
+    test_loss /= (batch_idx + 1)
+    print('\nValidation set - loss: {:.4f} - val-acc: {:.0f}%\n'.format(
+        test_loss, (correct / ((batch_idx + 1) * batch_size))*100))
 
+
+# load lookup table and labelencoder
+with open('../data/labelencoder.pkl', 'rb') as f:
+    labelencoder = pickle.load(f)
+categories = pd.read_csv('../data/categories.csv')
+
+# parameters
+batch_size = 32
+learning_rate = 1e-3
+epochs = 3
+num_classes = len(labelencoder.classes_)
+val_split = round(0.9*(7069896//batch_size))
+accum_iter = 8
+print_iter = 10
+
+# load ResNet50 without ImageNet weights
+model = resnet50(pretrained=False)
+
+# freeze all parameters
+for param in model.parameters():
+    param.requires_grad = False
+model.fc = nn.Linear(2048, 5270)
+
+# load pre-trained Cdiscount weights
+model.load_state_dict(torch.load('resnet50_2ep_finetuneClf.pth'))
+
+# unfreeze fully-connected and 3rd/4th layer
+for param in model.layer4.parameters():
+    param.requires_grad = True
+for param in model.layer3.parameters():
+    param.requires_grad = True
+
+# send model to GPU
+model.cuda()
+
+# loss and optimizer
+crit = nn.CrossEntropyLoss()
+optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), 
+                      lr=learning_rate, momentum=0.9, weight_decay=5e-4)
+
+# train the model
 for e in range(epochs):
     data_loader = batch_generator('../data/train.bson', batch_size=batch_size)
     train(e)
     test()
-    torch.save(model.state_dict(), './resnet50_{}ep_finetuneClf.pth'.format(e+1))
+    torch.save(model.state_dict(), './resnet50_{}-epoch_finetune-fc-lyr3-lyr4.pth'.format(e+1))
 
-print('\nFinished in {}s.'.format(format(time.time() - start_time, '.1f')))
-
-# # train the model
-# for e in range(epochs):
-#     preds=[]
-#     trues=[]
-#     correct = 0
-#     train_gen = batch_generator('../data/train.bson', batch_size=batch_size)
-#     for i, (x, y) in enumerate(train_gen, 1):
-
-#         # train
-#         if i < 10:
-#             optimizer.zero_grad()
-#             out = model(x)
-#             loss = crit(out, y.long())
-#             loss.backward()
-#             optimizer.step()
-
-#         # validate
-#         else:
-#             _, pred = torch.max(model(x), -1)
-#             correct += (pred == y).double().sum().data[0]
-
-#             # preds.append([np.argmax(xi) for xi in model(x).data.cpu().numpy()])
-#             # trues.append(y.data.cpu().numpy())
-#             if i > 20:
-#                 break
-
-#         # save loss
-#         loss_ = format(loss.data[0], '.4f')
-#         # write_loss(loss_)
-        
-#         # print batch and epoch statistics
-#         if i % 10 == 0:
-#             print('\rEpoch {}/{} - Batch {}/{} - loss: {}'.format(
-#                 e+1, epochs, i, 7069896//batch_size, loss_), end='')
-
-#         prec1 = accuracy(out.data, y.data)
-#         print(prec1)
-#     break
-#     np.savetxt('ep{}_preds.out'.format(e), np.array(preds).ravel(), delimiter=',')
-#     np.savetxt('ep{}_trues.out'.format(e), np.array(trues).ravel(), delimiter=',')
-
-
-
-# # save the model
-# torch.save(model.state_dict(), './resnet50_3ep_finetuneClf.pth')
-
+print('\nFinished.')
