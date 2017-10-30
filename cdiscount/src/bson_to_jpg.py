@@ -36,6 +36,6 @@ def bson_to_jpg(basepath, train=False):
 
 if __name__ == '__main__':
 	BASE_PATH = 'path/to/data.bson'
-	bson_to_jpg(BASE_PATH, train=True)
+	bson_to_jpg(BASE_PATH)
 
 
