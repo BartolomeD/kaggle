@@ -2,6 +2,7 @@ import os
 import pickle
 import io
 import bson
+import cv2
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
@@ -17,21 +18,11 @@ from torchvision import transforms
 
 # writes loss to file
 def write_loss(loss, acc):
-    w = '{}, {}\n'.format(format(loss, '.3f'), format(acc, '.2f'))
-    with open('exp2_loss.txt', 'a') as f:
+    w = '{}, {}'.format(format(loss, '.3f'), format(acc, '.2f'))
+    with open('exp4_loss.txt', 'a') as f:
         f.write(w)
 
-def batch_generator(data_path, size=130, batch_size=32, return_labels=True):
-
-    # preprocessing pipeline
-    process = transforms.Compose([
-        transforms.Scale(size),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        lambda x: x.cuda().view(1,3,size,size),
-        transforms.Normalize(mean=[.485, .456, .406],
-                             std=[.229, .224, .225])
-        ])
+def batch_generator(data_path, processing, batch_size=32, return_labels=True):
     
     # decode data
     data = bson.decode_file_iter(open(data_path, 'rb'))
@@ -50,7 +41,7 @@ def batch_generator(data_path, size=130, batch_size=32, return_labels=True):
         for image in item.get('imgs'):
 
             # from binary, process, augment and to tensor
-            proc_img = process(Image.open(io.BytesIO(image.get('picture', None))))
+            proc_img = processing(Image.open(io.BytesIO(image.get('picture', None))))
 
             # add to batch
             x = torch.cat([x, proc_img])
@@ -108,7 +99,7 @@ def train(epoch):
 
             # print the statistics
             print('\rEpoch {} [{}/{} ({:.0f}%)] - loss: {:.6f} - acc: {:.3f}'.format(
-                epoch+1, batch_idx * batch_size, 7069896, 100. * batch_idx / (7069896//batch_size), 
+                epoch+1, batch_idx * batch_size, 12371293, 100. * batch_idx / (12371293//batch_size), 
                 train_loss, train_acc), end='')
             
             # reset stats
@@ -117,7 +108,7 @@ def train(epoch):
             train_acc = 0
 
         # exit training phase
-        if batch_idx >= 10:
+        if batch_idx >= val_split:
             return
 
 def test():
@@ -138,36 +129,60 @@ def test():
         pred = output.data.max(1)[1]
         correct += pred.eq(y.data.view_as(pred)).cpu().sum()
 
+        if batch_idx % print_iter == 0:
+            print('\rValidating [{}/{} ({:.0f}%)]'.format(
+                val_split*batch_size+batch_idx*batch_size, 12371293, 
+                100. * batch_idx / (12371293//batch_size)), end='')
+
     # print validation phase statistics
     test_loss /= (batch_idx + 1)
     print('\nValidation set - loss: {:.4f} - val-acc: {:.0f}%\n'.format(
         test_loss, (correct / ((batch_idx + 1) * batch_size))*100))
 
-
 # load lookup table and labelencoder
 with open('../data/labelencoder.pkl', 'rb') as f:
     labelencoder = pickle.load(f)
-categories = pd.read_csv('../data/categories.csv')
 
 # parameters
 batch_size = 32
-learning_rate = 1e-3
-epochs = 3
-num_classes = len(labelencoder.classes_)
-val_split = round(0.9*(7069896//batch_size))
+image_size = 130
+epochs = 1
+num_classes = 5270
+val_split = round(0.9*(12371293//batch_size))
 accum_iter = 8
 print_iter = 10
 
-# load ResNet50 without ImageNet weights
-model = resnet50(pretrained=False)
+# preprocessing pipeline
+processing = transforms.Compose([
+    transforms.Scale(image_size),
+    transforms.ToTensor(),
+    lambda x: x.cuda().view(1,3,image_size,image_size),
+    transforms.Normalize(mean=[.485, .456, .406],
+                         std=[.229, .224, .225])
+    ])
+
+# load ResNet50 with ImageNet weights
+model = resnet50(pretrained=True)
 
 # freeze all parameters
 for param in model.parameters():
     param.requires_grad = False
 model.fc = nn.Linear(2048, 5270)
 
-# load pre-trained Cdiscount weights
-model.load_state_dict(torch.load('resnet50_2ep_finetuneClf.pth'))
+# send model to GPU
+model.cuda()
+
+# loss and optimizer
+crit = nn.CrossEntropyLoss().cuda()
+optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), 
+                      lr=1e-2, momentum=0.9, weight_decay=1e-6)
+
+# pre-train fc layer
+for e in range(1):
+    data_loader = batch_generator('../data/train.bson', processing, batch_size=batch_size)
+    train(e)
+    torch.save(model.state_dict(), './resnet50_{}-epoch_fc-pretrain.pth'.format(e+1))
+    test()
 
 # unfreeze fully-connected and 3rd/4th layer
 for param in model.layer4.parameters():
@@ -175,19 +190,15 @@ for param in model.layer4.parameters():
 for param in model.layer3.parameters():
     param.requires_grad = True
 
-# send model to GPU
-model.cuda()
-
-# loss and optimizer
-crit = nn.CrossEntropyLoss()
+# update optimizer with new weights
 optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), 
-                      lr=learning_rate, momentum=0.9, weight_decay=5e-4)
+                      lr=1e-4, momentum=0.9, weight_decay=1e-6)
 
-# train the model
+# train fc, layer3 and layer4
 for e in range(epochs):
-    data_loader = batch_generator('../data/train.bson', batch_size=batch_size)
+    data_loader = batch_generator('../data/train.bson', processing, batch_size=batch_size)
     train(e)
-    test()
     torch.save(model.state_dict(), './resnet50_{}-epoch_finetune-fc-lyr3-lyr4.pth'.format(e+1))
+    test()
 
 print('\nFinished.')
