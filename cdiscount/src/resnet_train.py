@@ -18,7 +18,7 @@ from torchvision import transforms
 
 # writes loss to file
 def write_loss(loss, acc):
-    w = '{}, {}'.format(format(loss, '.3f'), format(acc, '.2f'))
+    w = '{}, {}\n'.format(format(loss, '.3f'), format(acc, '.2f'))
     with open('exp4_loss.txt', 'a') as f:
         f.write(w)
 
@@ -149,7 +149,7 @@ image_size = 130
 epochs = 1
 num_classes = 5270
 val_split = round(0.9*(12371293//batch_size))
-accum_iter = 8
+accum_iter = 2
 print_iter = 10
 
 # preprocessing pipeline
@@ -162,29 +162,33 @@ processing = transforms.Compose([
     ])
 
 # load ResNet50 with ImageNet weights
-model = resnet50(pretrained=True)
+model = resnet50(pretrained=False)
 
 # freeze all parameters
 for param in model.parameters():
     param.requires_grad = False
-model.fc = nn.Linear(2048, 5270)
+model.fc = nn.Linear(2048, num_classes)
+
+model.load_state_dict(torch.load('resnet50_2-epoch_finetune-fc.pth'))
 
 # send model to GPU
 model.cuda()
 
-# loss and optimizer
+# # loss and optimizer
 crit = nn.CrossEntropyLoss().cuda()
-optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), 
-                      lr=1e-2, momentum=0.9, weight_decay=1e-6)
+# optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), 
+#                       lr=1e-2, momentum=0.9, weight_decay=1e-6)
 
-# pre-train fc layer
-for e in range(1):
-    data_loader = batch_generator('../data/train.bson', processing, batch_size=batch_size)
-    train(e)
-    torch.save(model.state_dict(), './resnet50_{}-epoch_fc-pretrain.pth'.format(e+1))
-    test()
+# # pre-train fc layer
+# for e in range(1):
+#     data_loader = batch_generator('../data/train.bson', processing, batch_size=batch_size)
+#     train(e)
+#     torch.save(model.state_dict(), './resnet50_{}-epoch_finetune-fc.pth'.format(e+1))
+#     test()
 
 # unfreeze fully-connected and 3rd/4th layer
+for param in model.fc.parameters():
+    param.requires_grad = True
 for param in model.layer4.parameters():
     param.requires_grad = True
 for param in model.layer3.parameters():
@@ -198,7 +202,7 @@ optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()),
 for e in range(epochs):
     data_loader = batch_generator('../data/train.bson', processing, batch_size=batch_size)
     train(e)
-    torch.save(model.state_dict(), './resnet50_{}-epoch_finetune-fc-lyr3-lyr4.pth'.format(e+1))
+    torch.save(model.state_dict(), './resnet50_3-epoch_finetune-fc.pth')
     test()
 
 print('\nFinished.')
